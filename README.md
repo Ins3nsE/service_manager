@@ -53,21 +53,6 @@ flutter build windows --release
 
 Разработка: `flutter run -d windows`
 
-### Создание инсталлятора
-
-Для создания установщика нужен Inno Setup 6. После установки Inno Setup выполните:
-
-```
-flutter build windows --release
-iscc installer\service_manager.iss
-```
-
-Готовый установщик будет создан в:
-
-```
-dist\service_manager_setup_1.0.0.exe
-```
-
 ### Сборка без режима разработчика Windows
 
 Flutter при сборке Windows создаёт симлинки плагинов, а для этого нужен
