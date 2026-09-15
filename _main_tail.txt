@@ -1,0 +1,360 @@
+﻿  }
+
+  void _handleTrayMenuAction(MenuItem menuItem) {
+    final key = menuItem.key ?? '';
+    if (key == 'show_window') {
+      _showWindow();
+      return;
+    }
+    if (key == 'quit') {
+      _quitApp();
+      return;
+    }
+    if (key == 'start_all') {
+      _startAll(fromTray: true);
+      return;
+    }
+    if (key == 'stop_all') {
+      _stopAll(fromTray: true);
+      return;
+    }
+    if (key.startsWith('start_service_')) {
+      final index = int.tryParse(key.substring('start_service_'.length));
+      if (index != null && index >= 0 && index < _entries.length) {
+        _runAction(_entries[index], start: true, fromTray: true);
+      }
+      return;
+    }
+    if (key.startsWith('stop_service_')) {
+      final index = int.tryParse(key.substring('stop_service_'.length));
+      if (index != null && index >= 0 && index < _entries.length) {
+        _runAction(_entries[index], start: false, fromTray: true);
+      }
+    }
+  }
+
+  // --- TrayListener ---------------------------------------------------------
+
+  @override
+  void onTrayIconMouseDown() {
+    // Левый клик по иконке трея — показать окно.
+    _showWindow();
+  }
+
+  @override
+  void onTrayIconRightMouseDown() {
+    // Правый клик: обновляем меню перед его показом.
+    _updateTrayMenu();
+  }
+
+  @override
+  void onTrayMenuItemClick(MenuItem menuItem) {
+    _handleTrayMenuAction(menuItem);
+  }
+
+  // --- WindowListener -------------------------------------------------------
+
+  @override
+  void onWindowClose() {
+    // Закрытие окна (крестик, Alt+F4) скрывает приложение в трей.
+    _hideToTray();
+  }
+
+  void _showAdminRequiredDialog() {
+    showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Требуются права администратора'),
+        content: const Text(
+          'Для запуска и остановки служб приложение должно работать '
+          'от имени администратора. Перезапустить приложение сейчас?',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: const Text('Отмена'),
+          ),
+          FilledButton(
+            onPressed: () {
+              Navigator.of(dialogContext).pop();
+              _relaunchElevated();
+            },
+            child: const Text('Перезапустить'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _relaunchElevated() async {
+    final ok = await relaunchElevated();
+    if (!mounted) return;
+    if (ok) {
+      _showMessage('Запущена новая копия с правами администратора. '
+          'Текущее окно будет закрыто.');
+      await Future<void>.delayed(const Duration(seconds: 2));
+      exit(0);
+    } else {
+      _showMessage('Не удалось перезапустить приложение '
+          'с правами администратора.');
+    }
+  }
+
+  void _showMessage(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Менеджер служб Windows'),
+        actions: [
+          IconButton(
+            tooltip: 'Свернуть в трей',
+            icon: const Icon(Icons.picture_in_picture_alt_outlined),
+            onPressed: _hideToTray,
+          ),
+          IconButton(
+            tooltip: 'Обновить статус',
+            icon: const Icon(Icons.refresh),
+            onPressed: _refreshing ? null : _refreshAll,
+          ),
+          IconButton(
+            tooltip: 'Выйти из приложения',
+            icon: const Icon(Icons.logout),
+            onPressed: _quitApp,
+          ),
+        ],
+      ),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          if (!_adminChecked)
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 32),
+              child: Center(child: CircularProgressIndicator()),
+            )
+          else if (!_isAdmin)
+            _AdminBanner(onRelaunch: _relaunchElevated),
+          const SizedBox(height: 8),
+          ..._entries.map(
+            (entry) => _ServiceCard(
+              entry: entry,
+              onStart: () => _runAction(entry, start: true),
+              onStop: () => _runAction(entry, start: false),
+            ),
+          ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Expanded(
+                child: FilledButton.icon(
+                  onPressed: _isAdmin ? _startAll : null,
+                  icon: const Icon(Icons.play_circle_outline),
+                  label: const Text('Запустить все'),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: FilledButton.tonalIcon(
+                  onPressed: _isAdmin ? _stopAll : null,
+                  icon: const Icon(Icons.stop_circle_outlined),
+                  label: const Text('Остановить все'),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 24),
+          Text(
+            'Управление службами выполняется утилитой sc.exe.\n'
+            'Для изменений требуются права администратора.\n'
+            'Закрытие окна скрывает приложение в трей — управлять службами '
+            'можно из его контекстного меню.',
+            style: Theme.of(context).textTheme.bodySmall,
+            textAlign: TextAlign.center,
+          ),
+        ],
+      ),
+    );
+  }
+}
+class _AdminBanner extends StatelessWidget {
+  const _AdminBanner({required this.onRelaunch});
+
+  final VoidCallback onRelaunch;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Card(
+      margin: const EdgeInsets.only(bottom: 12),
+      color: scheme.errorContainer,
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Row(
+          children: [
+            Icon(Icons.shield_outlined, color: scheme.onErrorContainer),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Text(
+                'Приложение запущено без прав администратора.\n'
+                'Для запуска и остановки служб перезапустите его '
+                'от имени администратора.',
+                style: TextStyle(color: scheme.onErrorContainer),
+              ),
+            ),
+            const SizedBox(width: 12),
+            FilledButton(
+              style: FilledButton.styleFrom(
+                backgroundColor: scheme.onErrorContainer,
+                foregroundColor: scheme.errorContainer,
+              ),
+              onPressed: onRelaunch,
+              child: const Text('Перезапустить'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _ServiceCard extends StatelessWidget {
+  const _ServiceCard({
+    required this.entry,
+    required this.onStart,
+    required this.onStop,
+  });
+
+  final _ServiceEntry entry;
+  final VoidCallback onStart;
+  final VoidCallback onStop;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final statusColor = switch (entry.status) {
+      ServiceStatus.running => Colors.green,
+      ServiceStatus.stopped => theme.colorScheme.error,
+      ServiceStatus.startPending || ServiceStatus.stopPending => Colors.orange,
+      ServiceStatus.unknown => Colors.grey,
+    };
+    final statusIcon = switch (entry.status) {
+      ServiceStatus.running => Icons.check_circle,
+      ServiceStatus.stopped => Icons.cancel,
+      ServiceStatus.startPending || ServiceStatus.stopPending =>
+        Icons.hourglass_top,
+      ServiceStatus.unknown => Icons.help_outline,
+    };
+
+    final canStart = !entry.busy && entry.status != ServiceStatus.running;
+    final canStop = !entry.busy && entry.status != ServiceStatus.stopped;
+
+    return Card(
+      margin: const EdgeInsets.only(bottom: 12),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Icon(statusIcon, color: statusColor, size: 28),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        entry.def.name,
+                        style: theme.textTheme.titleMedium?.copyWith(
+                          fontFeatures: const [FontFeature.tabularFigures()],
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                      Text(entry.displayName, style: theme.textTheme.bodySmall),
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 8),
+                _StatusPill(status: entry.status),
+              ],
+            ),
+            if (entry.busy) ...[
+              const SizedBox(height: 12),
+              const LinearProgressIndicator(),
+            ],
+            const SizedBox(height: 12),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                FilledButton.icon(
+                  onPressed: canStart ? onStart : null,
+                  icon: const Icon(Icons.play_arrow),
+                  label: const Text('Запустить'),
+                ),
+                OutlinedButton.icon(
+                  onPressed: canStop ? onStop : null,
+                  icon: const Icon(Icons.stop),
+                  label: const Text('Остановить'),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _StatusPill extends StatelessWidget {
+  const _StatusPill({required this.status});
+
+  final ServiceStatus status;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = switch (status) {
+      ServiceStatus.running => Colors.green,
+      ServiceStatus.stopped => Theme.of(context).colorScheme.error,
+      ServiceStatus.startPending || ServiceStatus.stopPending => Colors.orange,
+      ServiceStatus.unknown => Colors.grey,
+    };
+    final icon = switch (status) {
+      ServiceStatus.running => Icons.check_circle,
+      ServiceStatus.stopped => Icons.cancel,
+      ServiceStatus.startPending || ServiceStatus.stopPending =>
+        Icons.hourglass_top,
+      ServiceStatus.unknown => Icons.help_outline,
+    };
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: color.withValues(alpha: 0.5)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 16, color: color),
+          const SizedBox(width: 6),
+          Text(
+            status.label,
+            style: TextStyle(
+              color: color,
+              fontWeight: FontWeight.w600,
+              fontSize: 12,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}

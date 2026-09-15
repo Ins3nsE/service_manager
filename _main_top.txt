@@ -1,0 +1,370 @@
+﻿import 'dart:async';
+import 'dart:io';
+
+import 'package:flutter/material.dart';
+import 'package:tray_manager/tray_manager.dart';
+import 'package:window_manager/window_manager.dart';
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  // Управление окном должно быть инициализировано до запуска приложения.
+  await windowManager.ensureInitialized();
+  // Закрытие окна не завершает приложение, а скрывает его в системный трей.
+  await windowManager.setPreventClose(true);
+  runApp(const ServiceManagerApp());
+}
+
+// ============================================================================
+// Модель: список отслеживаемых служб
+// ============================================================================
+
+class ServiceDef {
+  const ServiceDef(this.name, this.fallbackDisplayName);
+
+  /// Имя службы в системе (используется утилитой sc.exe).
+  final String name;
+
+  /// Отображаемое имя, если не удалось получить его от системы.
+  final String fallbackDisplayName;
+}
+
+/// Службы, которыми управляет приложение.
+///
+/// Порядок важен: при запуске всех служб первой стартует MSSQLSERVER,
+/// при остановке всех служб первой останавливается 1С.
+const List<ServiceDef> kServices = [
+  ServiceDef('MSSQLSERVER', 'SQL Server (MSSQLSERVER)'),
+  ServiceDef(
+    '1C:Enterprise 8.5 Server Agent (x86-64)',
+    'Агент сервера 1С:Предприятия 8.5 (x86-64)',
+  ),
+];
+
+enum ServiceStatus {
+  stopped('Остановлена'),
+  running('Работает'),
+  startPending('Запускается...'),
+  stopPending('Останавливается...'),
+  unknown('Неизвестно');
+
+  const ServiceStatus(this.label);
+
+  final String label;
+}
+// ============================================================================
+// Работа с системой (sc.exe, powershell.exe)
+// ============================================================================
+
+class ScResult {
+  const ScResult(this.exitCode, this.stdout, this.stderr);
+
+  final int exitCode;
+  final String stdout;
+  final String stderr;
+}
+
+Future<ScResult> _runSc(List<String> args) async {
+  try {
+    final result = await Process.run('sc.exe', args);
+    return ScResult(
+      result.exitCode,
+      result.stdout.toString(),
+      result.stderr.toString(),
+    );
+  } catch (_) {
+    return const ScResult(-1, '', 'Не удалось запустить sc.exe');
+  }
+}
+
+/// Разбирает состояние службы из вывода `sc query`.
+///
+/// Вывод локализован: на русской Windows ключ называется «Состояние»,
+/// на английской — `STATE`. Коды (1, 2, 3, 4) и имена состояний (RUNNING,
+/// STOPPED и т.д.) не переводятся, поэтому парсим код состояния независимо
+/// от локали: 1 — STOPPED, 2 — START_PENDING, 3 — STOP_PENDING, 4 — RUNNING.
+ServiceStatus parseServiceStatus(String stdout) {
+  var code = int.tryParse(
+    RegExp(r'(?:STATE|Состояние)\s*:\s*(\d+)')
+        .firstMatch(stdout)
+        ?.group(1) ??
+        '',
+  );
+  // Запасной вариант: ищем код перед известным именем состояния —
+  // подходит, если ключ локализован иначе.
+  code ??= int.tryParse(
+    RegExp(r'[:\s](\d+)\s+(?:RUNNING|STOPPED|START_PENDING|STOP_PENDING)')
+        .firstMatch(stdout)
+        ?.group(1) ??
+        '',
+  );
+  return switch (code) {
+    4 => ServiceStatus.running,
+    1 => ServiceStatus.stopped,
+    2 => ServiceStatus.startPending,
+    3 => ServiceStatus.stopPending,
+    _ => ServiceStatus.unknown,
+  };
+}
+
+/// Текущее состояние службы.
+Future<ServiceStatus> queryServiceStatus(String serviceName) async {
+  final result = await _runSc(['query', serviceName]);
+  if (result.exitCode != 0) {
+    return ServiceStatus.unknown;
+  }
+  return parseServiceStatus(result.stdout);
+}
+
+/// Отображаемое имя службы (например, «SQL Server (MSSQLSERVER)»).
+///
+/// Вывод `sc GetDisplayName` локализован («Имя = ...» на русской Windows,
+/// `name = ...` на английской), поэтому берём часть строки после « = ».
+Future<String> queryDisplayName(String serviceName, String fallback) async {
+  final result = await _runSc(['GetDisplayName', serviceName]);
+  if (result.exitCode != 0) return fallback;
+  final lines = result.stdout
+      .split(RegExp(r'[\r\n]+'))
+      .map((line) => line.trim())
+      .where((line) => line.isNotEmpty)
+      .toList();
+  if (lines.isEmpty) return fallback;
+  final last = lines.last;
+  final eq = last.indexOf(' = ');
+  return eq >= 0 ? last.substring(eq + 3).trim() : last;
+}
+/// Запускает службу. Возвращает null при успехе или текст ошибки.
+Future<String?> startService(String serviceName) async {
+  final result = await _runSc(['start', serviceName]);
+  // 1056 — «служба уже запущена», считаем успехом.
+  if (result.exitCode == 0 || result.exitCode == 1056) return null;
+  return _describeScError(result, 'запуске');
+}
+
+/// Останавливает службу. Возвращает null при успехе или текст ошибки.
+Future<String?> stopService(String serviceName) async {
+  final result = await _runSc(['stop', serviceName]);
+  // 1062 — «служба не запущена», считаем успехом.
+  if (result.exitCode == 0 || result.exitCode == 1062) return null;
+  return _describeScError(result, 'остановке');
+}
+
+const Map<int, String> _knownScErrors = {
+  5: 'Отказано в доступе. Запустите приложение от имени администратора.',
+  1058: 'Служба отключена (тип запуска — «Отключена»).',
+  1060: 'Служба не найдена на этом компьютере.',
+  1072: 'Служба помечена на удаление.',
+  1053: 'Служба не ответила на запрос управления вовремя.',
+};
+
+String _describeScError(ScResult result, String action) {
+  final known = _knownScErrors[result.exitCode];
+  if (known != null) return known;
+  final detail =
+      (result.stderr.isNotEmpty ? result.stderr : result.stdout).trim();
+  return 'Не удалось выполнить операцию «$action» '
+      '(код ${result.exitCode}).${detail.isEmpty ? '' : '\n$detail'}';
+}
+
+/// Проверяет, запущено ли приложение с правами администратора.
+Future<bool> isAdministrator() async {
+  const script = '([Security.Principal.WindowsPrincipal]'
+      '[Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole('
+      '[Security.Principal.WindowsBuiltInRole]::Administrator)';
+  try {
+    final result = await Process.run(
+      'powershell.exe',
+      ['-NoProfile', '-Command', script],
+    );
+    return result.stdout.toString().trim().toLowerCase() == 'true';
+  } catch (_) {
+    return false;
+  }
+}
+
+/// Запускает новую копию приложения от имени администратора (запрос UAC).
+Future<bool> relaunchElevated() async {
+  final exe = Platform.resolvedExecutable;
+  final script = 'Start-Process -Verb RunAs -FilePath "$exe"';
+  try {
+    final result = await Process.run(
+      'powershell.exe',
+      ['-NoProfile', '-Command', script],
+    );
+    return result.exitCode == 0;
+  } catch (_) {
+    return false;
+  }
+}
+
+// ============================================================================
+// Приложение
+// ============================================================================
+
+class ServiceManagerApp extends StatelessWidget {
+  const ServiceManagerApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Менеджер служб Windows',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF1565C0)),
+        useMaterial3: true,
+      ),
+      darkTheme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: const Color(0xFF1565C0),
+          brightness: Brightness.dark,
+        ),
+        useMaterial3: true,
+      ),
+      home: const HomePage(),
+    );
+  }
+}
+
+class HomePage extends StatefulWidget {
+  const HomePage({super.key});
+
+  @override
+  State<HomePage> createState() => _HomePageState();
+}
+
+class _ServiceEntry {
+  _ServiceEntry(this.def)
+      : displayName = def.fallbackDisplayName,
+        status = ServiceStatus.unknown;
+
+  final ServiceDef def;
+  String displayName;
+  ServiceStatus status;
+  bool busy = false;
+}
+
+class _HomePageState extends State<HomePage>
+    with TrayListener, WindowListener {
+  final List<_ServiceEntry> _entries =
+      kServices.map((entry) => _ServiceEntry(entry)).toList();
+
+  bool _isAdmin = false;
+  bool _adminChecked = false;
+  bool _refreshing = false;
+  Timer? _timer;
+
+  /// Инициализирована ли иконка в трее (для безопасного вызова setContextMenu).
+  bool _trayReady = false;
+  String? _lastTrayMenuSignature;
+
+  @override
+  void initState() {
+    super.initState();
+    trayManager.addListener(this);
+    windowManager.addListener(this);
+    _initTray();
+    _checkAdmin();
+    _refreshAll();
+    _timer = Timer.periodic(const Duration(seconds: 5), (_) => _refreshAll());
+  }
+
+  @override
+  void dispose() {
+    trayManager.removeListener(this);
+    windowManager.removeListener(this);
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _checkAdmin() async {
+    final admin = await isAdministrator();
+    if (!mounted) return;
+    setState(() {
+      _isAdmin = admin;
+      _adminChecked = true;
+    });
+    await _updateTrayMenu();
+  }
+
+  Future<void> _refreshAll() async {
+    if (_refreshing) return;
+    _refreshing = true;
+    for (final entry in _entries) {
+      if (entry.busy) continue;
+      final status = await queryServiceStatus(entry.def.name);
+      if (status != ServiceStatus.unknown) entry.status = status;
+      if (entry.displayName == entry.def.fallbackDisplayName) {
+        final displayName = await queryDisplayName(
+          entry.def.name,
+          entry.def.fallbackDisplayName,
+        );
+        entry.displayName = displayName;
+      }
+      if (!mounted) return;
+    }
+    _refreshing = false;
+    if (mounted) setState(() {});
+    await _updateTrayMenu();
+  }
+  /// Выполняет действие над службой. [fromTray] — вызов из контекстного меню
+  /// трея: при успехе не показывает SnackBar, при ошибке открывает окно.
+  Future<void> _runAction(
+    _ServiceEntry entry, {
+    required bool start,
+    bool fromTray = false,
+  }) async {
+    if (!_isAdmin) {
+      if (fromTray) await _showWindow();
+      if (mounted) _showAdminRequiredDialog();
+      return;
+    }
+    setState(() => entry.busy = true);
+    await _updateTrayMenu();
+    final error = start
+        ? await startService(entry.def.name)
+        : await stopService(entry.def.name);
+
+    if (!mounted) return;
+    setState(() => entry.busy = false);
+
+    if (error != null) {
+      if (fromTray) await _showWindow();
+      if (mounted) {
+        _showMessage('Не удалось ${start ? 'запустить' : 'остановить'} '
+            'службу «${entry.def.name}».\n$error');
+      }
+    } else if (!fromTray) {
+      _showMessage('Служба «${entry.def.name}» '
+          '${start ? 'запущена' : 'остановлена'}.');
+      // Дожидаемся фактического перехода службы в целевое состояние,
+      // чтобы статус и кнопки обновились сразу.
+      await _waitForStatus(
+        entry,
+        start ? ServiceStatus.running : ServiceStatus.stopped,
+        start ? ServiceStatus.startPending : ServiceStatus.stopPending,
+      );
+    } else {
+      // Действие из трея: дожидаемся целевого состояния без SnackBar.
+      await _waitForStatus(
+        entry,
+        start ? ServiceStatus.running : ServiceStatus.stopped,
+        start ? ServiceStatus.startPending : ServiceStatus.stopPending,
+      );
+    }
+
+    // При ошибке просто перечитаем фактический статус службы.
+    final status = await queryServiceStatus(entry.def.name);
+    if (!mounted) return;
+    if (status != ServiceStatus.unknown) {
+      setState(() => entry.status = status);
+    }
+    await _updateTrayMenu();
+  }
+
+  /// Ожидает перехода службы в целевое состояние [target] (до 30 секунд),
+  /// на каждом шаге обновляя статус в интерфейсе и меню трея.
+  Future<void> _waitForStatus(
+    _ServiceEntry entry,
+    ServiceStatus target,
+    ServiceStatus pending, {
+    Duration timeout = const Duration(seconds: 30),
+  }) async {

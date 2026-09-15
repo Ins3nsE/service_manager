@@ -1,0 +1,75 @@
+﻿// ============================================================================
+
+class ServiceManagerApp extends StatelessWidget {
+  const ServiceManagerApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Менеджер служб Windows',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF1565C0)),
+        useMaterial3: true,
+      ),
+      darkTheme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: const Color(0xFF1565C0),
+          brightness: Brightness.dark,
+        ),
+        useMaterial3: true,
+      ),
+      home: const HomePage(),
+    );
+  }
+}
+
+class HomePage extends StatefulWidget {
+  const HomePage({super.key});
+
+  @override
+  State<HomePage> createState() => _HomePageState();
+}
+
+class _ServiceEntry {
+  _ServiceEntry(this.def)
+      : displayName = def.fallbackDisplayName,
+        status = ServiceStatus.unknown;
+
+  final ServiceDef def;
+  String displayName;
+  ServiceStatus status;
+  bool busy = false;
+}
+
+class _HomePageState extends State<HomePage>
+    with TrayListener, WindowListener {
+  final List<_ServiceEntry> _entries =
+      kServices.map((entry) => _ServiceEntry(entry)).toList();
+
+  bool _isAdmin = false;
+  bool _adminChecked = false;
+  bool _refreshing = false;
+  Timer? _timer;
+
+  /// Инициализирована ли иконка в трее (для безопасного вызова setContextMenu).
+  bool _trayReady = false;
+  String? _lastTrayMenuSignature;
+
+  @override
+  void initState() {
+    super.initState();
+    trayManager.addListener(this);
+    windowManager.addListener(this);
+    _initTray();
+    _checkAdmin();
+    _refreshAll();
+    _timer = Timer.periodic(const Duration(seconds: 5), (_) => _refreshAll());
+  }
+
+  @override
+  void dispose() {
+    trayManager.removeListener(this);
+    windowManager.removeListener(this);
+    _timer?.cancel();
+    super.dispose();

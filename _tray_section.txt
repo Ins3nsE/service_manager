@@ -1,0 +1,165 @@
+﻿    final deadline = DateTime.now().add(timeout);
+    while (DateTime.now().isBefore(deadline)) {
+      final status = await queryServiceStatus(entry.def.name);
+      if (!mounted) return;
+      if (status != ServiceStatus.unknown) {
+        setState(() => entry.status = status);
+        await _updateTrayMenu();
+      }
+      if (status == target) return;
+      final settled =
+          status == ServiceStatus.running || status == ServiceStatus.stopped;
+      // Служба перешла в стабильное состояние, отличное от целевого —
+      // дальнейшее ожидание бессмысленно.
+      if (settled && status != pending) return;
+      await Future<void>.delayed(const Duration(seconds: 1));
+    }
+  }
+
+  Future<void> _startAll({bool fromTray = false}) async {
+    // Сначала MSSQL, затем 1С (у 1С есть зависимость от SQL).
+    for (final entry in _entries) {
+      await _runAction(entry, start: true, fromTray: fromTray);
+    }
+  }
+
+  Future<void> _stopAll({bool fromTray = false}) async {
+    // Сначала 1С, затем MSSQL.
+    for (final entry in _entries.reversed) {
+      await _runAction(entry, start: false, fromTray: fromTray);
+    }
+  }
+
+  // ==========================================================================
+  // Системный трей и окно
+  // ==========================================================================
+
+  /// Создаёт иконку в системном трее.
+  ///
+  /// Путь к иконке указывается относительно `data/flutter_assets`
+  /// (именно так формирует полный путь сам плагин tray_manager).
+  Future<void> _initTray() async {
+    try {
+      await trayManager.setIcon('assets/tray_icon.ico');
+      await trayManager.setToolTip('Менеджер служб Windows');
+      _trayReady = true;
+      await _updateTrayMenu(force: true);
+    } catch (_) {
+      // Если иконку создать не удалось — приложение продолжит работать
+      // без трея (например, в окружении без области уведомлений).
+      _trayReady = false;
+    }
+  }
+
+  bool _canStartEntry(_ServiceEntry entry) =>
+      _isAdmin &&
+      !entry.busy &&
+      entry.status != ServiceStatus.running &&
+      entry.status != ServiceStatus.startPending;
+
+  bool _canStopEntry(_ServiceEntry entry) =>
+      _isAdmin && !entry.busy && entry.status == ServiceStatus.running;
+
+  /// Строка-сигнатура текущего состояния служб; по её изменению решаем,
+  /// нужно ли пересоздавать меню трея.
+  String _trayMenuSignature() {
+    final statuses =
+        _entries.map((e) => '${e.status.name}:${e.busy}').join('|');
+    return '$statuses|admin=$_isAdmin';
+  }
+
+  Menu _buildTrayMenu() {
+    final items = <MenuItem>[];
+
+    // Текущие статусы служб (информационные пункты).
+    for (var i = 0; i < _entries.length; i++) {
+      final entry = _entries[i];
+      items.add(MenuItem(
+        key: 'status_$i',
+        label: '${entry.def.name} — ${entry.status.label}',
+        disabled: true,
+      ));
+    }
+    items.add(MenuItem.separator());
+
+    // Управление отдельными службами.
+    for (var i = 0; i < _entries.length; i++) {
+      final entry = _entries[i];
+      items.add(MenuItem(
+        key: 'start_service_$i',
+        label: 'Запустить: ${entry.def.name}',
+        disabled: !_canStartEntry(entry),
+      ));
+      items.add(MenuItem(
+        key: 'stop_service_$i',
+        label: 'Остановить: ${entry.def.name}',
+        disabled: !_canStopEntry(entry),
+      ));
+    }
+    items.add(MenuItem.separator());
+
+    items.add(MenuItem(
+      key: 'start_all',
+      label: 'Запустить все службы',
+      disabled: !_entries.any(_canStartEntry),
+    ));
+    items.add(MenuItem(
+      key: 'stop_all',
+      label: 'Остановить все службы',
+      disabled: !_entries.any(_canStopEntry),
+    ));
+    items.add(MenuItem.separator());
+
+    items.add(MenuItem(key: 'show_window', label: 'Открыть окно'));
+    items.add(MenuItem(key: 'quit', label: 'Выход'));
+
+    return Menu(items: items);
+  }
+
+  /// Обновляет контекстное меню трея, если изменились статусы служб.
+  Future<void> _updateTrayMenu({bool force = false}) async {
+    if (!_trayReady) return;
+    final signature = _trayMenuSignature();
+    if (!force && signature == _lastTrayMenuSignature) return;
+    _lastTrayMenuSignature = signature;
+    try {
+      await trayManager.setContextMenu(_buildTrayMenu());
+    } catch (_) {
+      // Игнорируем ошибки обновления меню — трей может быть недоступен.
+    }
+  }
+
+  /// Показывает главное окно (восстанавливая его из свёрнутого состояния).
+  Future<void> _showWindow() async {
+    if (await windowManager.isMinimized()) {
+      await windowManager.restore();
+    }
+    await windowManager.show();
+    await windowManager.focus();
+  }
+
+  /// Скрывает главное окно в трей.
+  Future<void> _hideToTray() async {
+    await windowManager.hide();
+  }
+
+  /// Полностью завершает приложение: убирает иконку из трея и закрывает окно.
+  Future<void> _quitApp() async {
+    try {
+      await trayManager.destroy();
+    } catch (_) {
+      // Не критично, если иконка уже недоступна.
+    }
+    await windowManager.destroy();
+    exit(0);
+  }
+
+  void _handleTrayMenuAction(MenuItem menuItem) {
+    final key = menuItem.key ?? '';
+    if (key == 'show_window') {
+      _showWindow();
+      return;
+    }
+    if (key == 'quit') {
+      _quitApp();
+      return;

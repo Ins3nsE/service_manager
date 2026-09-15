@@ -1,0 +1,2 @@
+Building Windows application...                                    11,0s
+√ Built build\windows\x64\runner\Debug\service_manager.exe
